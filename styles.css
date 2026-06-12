@@ -652,6 +652,26 @@ button:disabled {
   border-left: 5px solid var(--worker-color, var(--teal));
 }
 
+.admin-password-form {
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) auto;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.admin-password-form input {
+  min-height: 38px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 10px;
+  outline: none;
+}
+
+.admin-password-form input:focus {
+  border-color: var(--teal);
+  box-shadow: 0 0 0 3px rgba(36, 117, 107, 0.14);
+}
+
 .shift-timetable {
   grid-template-columns: repeat(5, minmax(210px, 1fr));
 }
@@ -1022,6 +1042,7 @@ button:disabled {
 
   .inline-fields,
   .form-grid,
+  .admin-password-form,
   .stat-grid,
   .pointer-strip {
     grid-template-columns: 1fr;

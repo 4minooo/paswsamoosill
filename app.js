@@ -3,6 +3,7 @@ const STORAGE_KEY = "pknu-social-work-office-app:v1";
 const USER_KEY = "pknu-social-work-office-users:v1";
 const SESSION_KEY = "pknu-social-work-office-session:v1";
 const WORKSPACE_ID = "social-welfare-office";
+const PASSWORD_RESET_CONTACT = "비밀번호 초기화는 010-6633-7299 서민호로 연락주세요.";
 
 const DAYS = ["월", "화", "수", "목", "금"];
 const DAY_INDEX = { 월: 1, 화: 2, 수: 3, 목: 4, 금: 5 };
@@ -354,19 +355,24 @@ async function initFirebase() {
     const [
       appModule,
       authModule,
-      firestoreModule
+      firestoreModule,
+      functionsModule
     ] = await Promise.all([
       import("https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js"),
       import("https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js"),
-      import("https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js")
+      import("https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js"),
+      import("https://www.gstatic.com/firebasejs/10.12.5/firebase-functions.js")
     ]);
 
     const firebaseApp = appModule.initializeApp(config);
+    const functionsRegion = window.officeAppConfig?.functionsRegion || "asia-northeast3";
     firebaseApi = {
       auth: authModule.getAuth(firebaseApp),
       db: firestoreModule.getFirestore(firebaseApp),
+      functions: functionsModule.getFunctions(firebaseApp, functionsRegion),
       createUserWithEmailAndPassword: authModule.createUserWithEmailAndPassword,
       EmailAuthProvider: authModule.EmailAuthProvider,
+      httpsCallable: functionsModule.httpsCallable,
       reauthenticateWithCredential: authModule.reauthenticateWithCredential,
       signInWithEmailAndPassword: authModule.signInWithEmailAndPassword,
       signOut: authModule.signOut,
@@ -688,6 +694,9 @@ function attachGlobalListeners() {
     }
     if (type === "password") {
       await changePassword(form);
+    }
+    if (type === "admin-password") {
+      await adminChangeMemberPassword(form);
     }
   });
 }
@@ -1511,6 +1520,7 @@ function renderMemberList(members, admin) {
           const canRestore = admin && member.status === "banned";
           const canGrantAdmin = admin && member.status === "approved" && member.role !== "admin";
           const canRevokeAdmin = admin && member.status === "approved" && member.role === "admin" && member.studentId !== currentUser.studentId && !fixedAdmin;
+          const canChangePassword = admin && member.studentId !== currentUser.studentId;
           return `
             <div class="shift-card" style="--worker-color: ${member.color || WORKER_COLORS[0]}">
               <div class="item-head">
@@ -1526,6 +1536,18 @@ function renderMemberList(members, admin) {
                   ${canRestore ? `<button class="secondary-button" type="button" data-action="restore-member" data-id="${member.studentId}">복구</button>` : ""}
                 </div>
               </div>
+              ${
+                canChangePassword
+                  ? `
+                    <form class="admin-password-form" data-form="admin-password">
+                      <input type="hidden" name="studentId" value="${escapeAttr(member.studentId)}" />
+                      <input type="hidden" name="name" value="${escapeAttr(member.name)}" />
+                      <input name="newPassword" type="password" minlength="6" required placeholder="새 비밀번호" autocomplete="new-password" />
+                      <button class="secondary-button" type="submit">비밀번호 변경</button>
+                    </form>
+                  `
+                  : ""
+              }
             </div>
           `;
         })
@@ -1673,7 +1695,7 @@ async function handleAuth(form) {
     startRealtimeSync();
     render();
   } catch (error) {
-    renderAuth(error.message || "로그인 처리 중 오류가 발생했습니다.");
+    renderAuth(getLoginErrorMessage(error));
   }
 }
 
@@ -1734,6 +1756,84 @@ function handleLocalAuth({ name, studentId, password }) {
   }
   currentUser = user;
   localStorage.setItem(SESSION_KEY, JSON.stringify({ studentId }));
+}
+
+function getLoginErrorMessage(error) {
+  const code = error?.code || "";
+  const message = error?.message || "";
+  const looksLikePasswordError =
+    code.includes("wrong-password") ||
+    code.includes("invalid-credential") ||
+    code.includes("user-not-found") ||
+    message.includes("비밀번호") ||
+    message.includes("가입 정보");
+
+  if (authMode === "login" && looksLikePasswordError) {
+    return PASSWORD_RESET_CONTACT;
+  }
+
+  return message || "로그인 처리 중 오류가 발생했습니다.";
+}
+
+async function adminChangeMemberPassword(form) {
+  if (!isCurrentAdmin()) {
+    render("관리자만 비밀번호를 변경할 수 있습니다.");
+    return;
+  }
+
+  const data = new FormData(form);
+  const studentId = normalizeStudentId(String(data.get("studentId") || ""));
+  const name = String(data.get("name") || "").trim();
+  const newPassword = String(data.get("newPassword") || "");
+
+  if (!studentId || !newPassword) {
+    render("새 비밀번호를 입력하세요.");
+    return;
+  }
+
+  if (newPassword.length < 6) {
+    render("새 비밀번호는 6자 이상이어야 합니다.");
+    return;
+  }
+
+  if (studentId === currentUser.studentId) {
+    render("내 비밀번호는 개인정보 설정에서 변경하세요.");
+    return;
+  }
+
+  try {
+    if (services.mode === "firebase" && firebaseApi) {
+      const updateMemberPassword = firebaseApi.httpsCallable(firebaseApi.functions, "updateMemberPassword");
+      await updateMemberPassword({ studentId, newPassword });
+    } else {
+      const users = readJson(USER_KEY, []);
+      const target = users.find((user) => user.studentId === studentId);
+      if (!target) {
+        throw new Error("로컬 테스트 계정을 찾을 수 없습니다.");
+      }
+      target.password = newPassword;
+      localStorage.setItem(USER_KEY, JSON.stringify(users));
+    }
+
+    form.reset();
+    render(`${name || studentId}의 비밀번호를 변경했습니다.`);
+  } catch (error) {
+    render(getAdminPasswordErrorMessage(error));
+  }
+}
+
+function getAdminPasswordErrorMessage(error) {
+  const code = error?.code || "";
+  if (code.includes("functions/not-found")) {
+    return "관리자 비밀번호 변경 기능을 사용하려면 Firebase Cloud Function을 먼저 배포해야 합니다.";
+  }
+  if (code.includes("permission-denied")) {
+    return "관리자 권한을 확인할 수 없어 비밀번호를 변경하지 못했습니다.";
+  }
+  if (code.includes("invalid-argument")) {
+    return "새 비밀번호는 6자 이상이어야 합니다.";
+  }
+  return error?.message || "비밀번호 변경 중 오류가 발생했습니다.";
 }
 
 async function changePassword(form) {

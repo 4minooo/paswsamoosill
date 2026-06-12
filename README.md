@@ -16,6 +16,7 @@
 - To Do List
 - 공지 고정 메모장
 - 개인정보 설정과 본인 비밀번호 변경
+- 관리자에 의한 근로생 비밀번호 변경
 - Firebase 미설정 시 로컬 저장소 데모 모드
 - Firebase 연결 시 실시간 동기화
 
@@ -62,7 +63,20 @@ window.officeAppConfig = {
 
 Firebase 연결 상태에서는 Firestore 실시간 리스너를 사용합니다. 한 사용자가 수업 세팅, 회수, 근로 일정, To Do, 메모, 회원 승인 상태를 바꾸면 다른 사용자의 열린 화면에도 자동 반영됩니다.
 
-Firebase Auth 비밀번호는 관리자도 확인할 수 없습니다. 사용자는 개인정보 설정에서 본인 비밀번호를 직접 변경합니다. 비밀번호 분실자를 관리자가 처리하려면 별도 관리자 서버나 Firebase Admin SDK 기반 초기화 기능을 추가해야 합니다.
+Firebase Auth 비밀번호는 관리자도 확인할 수 없습니다. 사용자는 개인정보 설정에서 본인 비밀번호를 직접 변경합니다. 관리자는 근로생 명단에서 새 비밀번호를 설정할 수 있으며, 이 기능은 Firebase Cloud Functions와 Admin SDK를 통해 처리됩니다.
+
+## Firebase Functions 배포
+
+관리자 비밀번호 변경 기능을 사용하려면 Firebase Cloud Functions를 배포해야 합니다.
+
+```bash
+cd functions
+npm install
+cd ..
+firebase deploy --only functions
+```
+
+배포 후 Vercel 앱에서 근로생 명단의 `비밀번호 변경` 버튼을 사용할 수 있습니다. Cloud Functions 사용에는 Firebase 프로젝트 설정에 따라 결제 계정 연결이 필요할 수 있습니다.
 
 ## 개발용 로컬 모드
 

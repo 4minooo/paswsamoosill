@@ -9,5 +9,6 @@ window.firebaseConfig = {
 };
 
 window.officeAppConfig = {
-  adminStudentIds: ["202210276"]
+  adminStudentIds: ["202210276"],
+  functionsRegion: "asia-northeast3"
 };
