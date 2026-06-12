@@ -6,6 +6,9 @@ const WORKSPACE_ID = "social-welfare-office";
 
 const DAYS = ["월", "화", "수", "목", "금"];
 const DAY_INDEX = { 월: 1, 화: 2, 수: 3, 목: 4, 금: 5 };
+const SHIFT_DISPLAY_START = 9 * 60;
+const SHIFT_DISPLAY_END = 19 * 60;
+const SHIFT_DISPLAY_RANGE = SHIFT_DISPLAY_END - SHIFT_DISPLAY_START;
 const VIEW_LABELS = {
   dashboard: "홈",
   shifts: "근로 시간표",
@@ -310,6 +313,7 @@ let calendarCursor = new Date();
 let services = { mode: "local", label: "로컬 저장" };
 let firebaseApi = null;
 let saveTimer = null;
+let workspaceUnsubscribe = null;
 
 const app = document.querySelector("#app");
 
@@ -322,6 +326,8 @@ async function boot() {
   await enforceConfiguredAdmins();
   if (currentUser) {
     await reconcileCurrentMember();
+    await flushSave();
+    startRealtimeSync();
   }
   attachGlobalListeners();
   render();
@@ -359,11 +365,12 @@ async function initFirebase() {
       updateProfile: authModule.updateProfile,
       doc: firestoreModule.doc,
       getDoc: firestoreModule.getDoc,
+      onSnapshot: firestoreModule.onSnapshot,
       setDoc: firestoreModule.setDoc,
       serverTimestamp: firestoreModule.serverTimestamp
     };
 
-    return { mode: "firebase", label: "Firebase 연결" };
+    return { mode: "firebase", label: "Firebase 실시간 연결" };
   } catch (error) {
     console.warn("Firebase 초기화 실패", error);
     return { mode: "local", label: "로컬 저장" };
@@ -496,25 +503,62 @@ function mergeState(base, saved) {
 
 function scheduleSave() {
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(async () => {
-    if (services.mode === "firebase" && firebaseApi) {
-      try {
-        const ref = firebaseApi.doc(firebaseApi.db, "workspaces", WORKSPACE_ID);
-        await firebaseApi.setDoc(
-          ref,
-          {
-            state,
-            updatedAt: firebaseApi.serverTimestamp()
-          },
-          { merge: true }
-        );
-        return;
-      } catch (error) {
-        console.warn("Firestore 저장 실패", error);
-      }
+  saveTimer = setTimeout(persistState, 180);
+}
+
+async function flushSave() {
+  clearTimeout(saveTimer);
+  await persistState();
+}
+
+async function persistState() {
+  if (services.mode === "firebase" && firebaseApi) {
+    try {
+      const ref = firebaseApi.doc(firebaseApi.db, "workspaces", WORKSPACE_ID);
+      await firebaseApi.setDoc(
+        ref,
+        {
+          state,
+          updatedAt: firebaseApi.serverTimestamp()
+        },
+        { merge: true }
+      );
+      return;
+    } catch (error) {
+      console.warn("Firestore 저장 실패", error);
     }
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-  }, 180);
+  }
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+}
+
+function startRealtimeSync() {
+  if (workspaceUnsubscribe || services.mode !== "firebase" || !firebaseApi || !currentUser) {
+    return;
+  }
+
+  const ref = firebaseApi.doc(firebaseApi.db, "workspaces", WORKSPACE_ID);
+  workspaceUnsubscribe = firebaseApi.onSnapshot(
+    ref,
+    async (snap) => {
+      if (!snap.exists()) return;
+      state = mergeState(createDefaultState(), snap.data()?.state || {});
+      await enforceConfiguredAdmins();
+      refreshCurrentUserFromMember();
+      if (selectedCourseId && !state.courses.some((course) => course.id === selectedCourseId)) {
+        selectedCourseId = null;
+      }
+      render();
+    },
+    (error) => {
+      console.warn("Firestore 실시간 동기화 실패", error);
+    }
+  );
+}
+
+function stopRealtimeSync() {
+  if (!workspaceUnsubscribe) return;
+  workspaceUnsubscribe();
+  workspaceUnsubscribe = null;
 }
 
 function attachGlobalListeners() {
@@ -558,8 +602,8 @@ function attachGlobalListeners() {
     if (action === "recover-course") {
       recoverCourse(target.dataset.id);
     }
-    if (action === "reset-course") {
-      resetCourse(target.dataset.id);
+    if (action === "return-course-pending") {
+      returnCourseToPending(target.dataset.id);
     }
     if (action === "delete-shift") {
       deleteShift(target.dataset.id);
@@ -797,14 +841,14 @@ function renderDashboard() {
   const todayShifts = getShiftsForDay(todayDay);
   const pendingTodos = state.todos.filter((todo) => !todo.done).sort(sortByDueDate).slice(0, 5);
   const notices = state.memos.filter((memo) => memo.notice).sort(sortByCreatedDesc).slice(0, 4);
-  const pendingCourses = state.courses.filter((course) => !isCourseRecovered(course.id)).length;
+  const todayRemainingCourses = state.courses.filter((course) => course.day === todayDay && !isCourseRecovered(course.id)).length;
   const activePointers = getPointerStatuses().filter((pointer) => pointer.course).length;
 
   return `
     <section class="stat-grid">
       ${renderStat(pendingTodos.length, "남은 업무")}
       ${renderStat(todayShifts.length, "오늘 근로")}
-      ${renderStat(pendingCourses, "회수 확인 필요")}
+      ${renderStat(todayRemainingCourses, "오늘 남은 수업")}
       ${renderStat(activePointers, "사용 중 포인터")}
     </section>
     ${renderPointerStrip()}
@@ -916,7 +960,7 @@ function renderShiftView() {
     <section class="panel" style="margin-top:16px;">
       <div class="panel-header">
         <h2>일주일 근로 시간표</h2>
-        <span class="badge teal">00~24시 기준</span>
+        <span class="badge teal">09~19시 기준</span>
       </div>
       <div class="panel-body">
         ${renderShiftTimetable()}
@@ -945,7 +989,10 @@ function renderDayTimeline(shifts) {
   return `
     <div class="timeline-wrap">
       <div class="timeline-grid">
-        ${Array.from({ length: 25 }, (_, hour) => `<span class="hour-label">${String(hour).padStart(2, "0")}:00</span>`).join("")}
+        ${Array.from({ length: 11 }, (_, index) => {
+          const hour = 9 + index;
+          return `<span class="hour-label">${String(hour).padStart(2, "0")}:00</span>`;
+        }).join("")}
       </div>
       <div class="timeline-lane">
         ${shifts.sort(sortByShiftTime).map(renderShiftBlock).join("")}
@@ -956,11 +1003,16 @@ function renderDayTimeline(shifts) {
 
 function renderShiftBlock(shift) {
   const worker = findWorker(shift.workerName, shift.studentId);
-  const start = minutesFromHHMM(shift.start);
-  const end = minutesFromHHMM(shift.end);
-  const top = Math.max(0, (start / 1440) * 100);
-  const height = Math.max(3.2, ((end - start) / 1440) * 100);
+  const start = Math.max(minutesFromHHMM(shift.start), SHIFT_DISPLAY_START);
+  const end = Math.min(minutesFromHHMM(shift.end), SHIFT_DISPLAY_END);
   const canDelete = canManageShift(shift);
+
+  if (end <= SHIFT_DISPLAY_START || start >= SHIFT_DISPLAY_END || end <= start) {
+    return "";
+  }
+
+  const top = Math.max(0, ((start - SHIFT_DISPLAY_START) / SHIFT_DISPLAY_RANGE) * 100);
+  const height = Math.max(7.2, ((end - start) / SHIFT_DISPLAY_RANGE) * 100);
 
   return `
     <div class="shift-block" style="--worker-color: ${worker?.color || WORKER_COLORS[0]}; top: ${top}%; height: ${height}%;">
@@ -1480,7 +1532,7 @@ function renderCourseDrawer(courseId) {
                       ? `<button class="primary-button" type="button" data-action="recover-course" data-id="${course.id}">회수 완료</button>`
                       : ""
                   }
-                  <button class="danger-button" type="button" data-action="reset-course" data-id="${course.id}">기록 초기화</button>
+                  <button class="danger-button" type="button" data-action="return-course-pending" data-id="${course.id}">세팅 전으로</button>
                 </div>
               `
           }
@@ -1522,7 +1574,8 @@ async function handleAuth(form) {
       handleLocalAuth({ name, studentId, password });
     }
     await reconcileCurrentMember({ signup: authMode === "signup" });
-    scheduleSave();
+    await flushSave();
+    startRealtimeSync();
     render();
   } catch (error) {
     renderAuth(error.message || "로그인 처리 중 오류가 발생했습니다.");
@@ -1589,6 +1642,7 @@ function handleLocalAuth({ name, studentId, password }) {
 }
 
 async function logout() {
+  stopRealtimeSync();
   if (services.mode === "firebase" && firebaseApi) {
     try {
       await firebaseApi.signOut(firebaseApi.auth);
@@ -1668,11 +1722,31 @@ function recoverCourse(courseId) {
   render("회수 상태가 저장되었습니다.");
 }
 
-function resetCourse(courseId) {
-  delete state.courseStates[courseId];
+function returnCourseToPending(courseId) {
+  const previous = state.courseStates[courseId];
+  if (!previous) return;
+
+  const { history = [], ...snapshot } = previous;
+  state.courseStates[courseId] = {
+    pointer: null,
+    setupBy: null,
+    setupAt: null,
+    recoveredBy: null,
+    recoveredAt: null,
+    returnedToPendingBy: currentUser.name,
+    returnedToPendingAt: nowIso(),
+    history: [
+      ...history,
+      {
+        ...snapshot,
+        returnedToPendingBy: currentUser.name,
+        returnedToPendingAt: nowIso()
+      }
+    ]
+  };
   scheduleSave();
   selectedCourseId = courseId;
-  render("수업 기록이 초기화되었습니다.");
+  render("세팅 전 상태로 돌렸습니다.");
 }
 
 function addTodo(form) {
@@ -1869,6 +1943,18 @@ function getMembersSorted() {
 function getCurrentMember() {
   if (!currentUser) return null;
   return state.members.find((member) => member.studentId === currentUser.studentId) || null;
+}
+
+function refreshCurrentUserFromMember() {
+  const member = getCurrentMember();
+  if (!currentUser || !member) return;
+  currentUser = {
+    ...currentUser,
+    name: member.name,
+    role: member.role,
+    status: member.status,
+    color: member.color
+  };
 }
 
 function isCurrentAdmin() {
