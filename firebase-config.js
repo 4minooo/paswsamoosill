@@ -9,5 +9,5 @@ window.firebaseConfig = {
 };
 
 window.officeAppConfig = {
-  adminStudentIds: []
+  adminStudentIds: ["202210276"]
 };

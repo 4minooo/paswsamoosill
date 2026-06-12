@@ -319,6 +319,7 @@ async function boot() {
   services = await initFirebase();
   currentUser = await restoreSession();
   state = await loadState();
+  await enforceConfiguredAdmins();
   if (currentUser) {
     await reconcileCurrentMember();
   }
@@ -583,6 +584,12 @@ function attachGlobalListeners() {
     }
     if (action === "restore-member") {
       restoreMember(target.dataset.id);
+    }
+    if (action === "grant-admin") {
+      grantAdmin(target.dataset.id);
+    }
+    if (action === "revoke-admin") {
+      revokeAdmin(target.dataset.id);
     }
   });
 
@@ -1351,9 +1358,12 @@ function renderMemberList(members, admin) {
     <div class="memo-list">
       ${members
         .map((member) => {
-          const canBan = admin && member.status === "approved" && member.studentId !== currentUser.studentId;
+          const fixedAdmin = isFixedAdminStudentId(member.studentId);
+          const canBan = admin && member.status === "approved" && member.studentId !== currentUser.studentId && !fixedAdmin;
           const canApprove = admin && member.status === "pending";
           const canRestore = admin && member.status === "banned";
+          const canGrantAdmin = admin && member.status === "approved" && member.role !== "admin";
+          const canRevokeAdmin = admin && member.status === "approved" && member.role === "admin" && member.studentId !== currentUser.studentId && !fixedAdmin;
           return `
             <div class="shift-card" style="--worker-color: ${member.color || WORKER_COLORS[0]}">
               <div class="item-head">
@@ -1363,6 +1373,8 @@ function renderMemberList(members, admin) {
                 </div>
                 <div class="item-actions">
                   ${canApprove ? `<button class="secondary-button" type="button" data-action="approve-member" data-id="${member.studentId}">승인</button>` : ""}
+                  ${canGrantAdmin ? `<button class="secondary-button" type="button" data-action="grant-admin" data-id="${member.studentId}">관리자 위임</button>` : ""}
+                  ${canRevokeAdmin ? `<button class="ghost-button" type="button" data-action="revoke-admin" data-id="${member.studentId}">관리자 해제</button>` : ""}
                   ${canBan ? `<button class="danger-button" type="button" data-action="ban-member" data-id="${member.studentId}">추방</button>` : ""}
                   ${canRestore ? `<button class="secondary-button" type="button" data-action="restore-member" data-id="${member.studentId}">복구</button>` : ""}
                 </div>
@@ -1779,8 +1791,47 @@ async function reconcileCurrentMember(options = {}) {
 }
 
 function shouldAutoApprove(studentId) {
-  if (ADMIN_STUDENT_IDS.includes(studentId)) return true;
+  if (ADMIN_STUDENT_IDS.length > 0) {
+    return ADMIN_STUDENT_IDS.includes(studentId);
+  }
   return !state.members.some((member) => member.role === "admin" && member.status === "approved");
+}
+
+function isFixedAdminStudentId(studentId) {
+  return ADMIN_STUDENT_IDS.includes(normalizeStudentId(studentId || ""));
+}
+
+async function enforceConfiguredAdmins() {
+  if (!ADMIN_STUDENT_IDS.length || !state.members?.length) return;
+
+  const changedMembers = [];
+  state.members = state.members.map((member) => {
+    const studentId = normalizeStudentId(member.studentId);
+    const fixedAdmin = ADMIN_STUDENT_IDS.includes(studentId);
+    let next = member;
+
+    if (fixedAdmin && (member.role !== "admin" || member.status !== "approved")) {
+      next = {
+        ...member,
+        role: "admin",
+        status: "approved",
+        approvedAt: member.approvedAt || nowIso(),
+        approvedBy: member.approvedBy || "system",
+        bannedAt: null,
+        bannedBy: null
+      };
+    }
+
+    if (next !== member) {
+      changedMembers.push(next);
+    }
+    return next;
+  });
+
+  if (changedMembers.length) {
+    await Promise.all(changedMembers.map(syncMemberProfile));
+    scheduleSave();
+  }
 }
 
 async function syncMemberProfile(member) {
@@ -1862,6 +1913,7 @@ function banMember(studentId) {
   if (!isCurrentAdmin() || studentId === currentUser.studentId) return;
   updateMember(studentId, (member) => ({
     ...member,
+    role: "worker",
     status: "banned",
     bannedAt: nowIso(),
     bannedBy: currentUser.studentId
@@ -1882,6 +1934,31 @@ function restoreMember(studentId) {
     bannedBy: null
   }));
   render("근로생 계정을 복구했습니다.");
+}
+
+function grantAdmin(studentId) {
+  if (!isCurrentAdmin()) return;
+  updateMember(studentId, (member) => {
+    if (member.status !== "approved") return member;
+    return {
+      ...member,
+      role: "admin",
+      delegatedAt: nowIso(),
+      delegatedBy: currentUser.studentId
+    };
+  });
+  render("관리자 권한을 위임했습니다.");
+}
+
+function revokeAdmin(studentId) {
+  if (!isCurrentAdmin() || studentId === currentUser.studentId || isFixedAdminStudentId(studentId)) return;
+  updateMember(studentId, (member) => ({
+    ...member,
+    role: "worker",
+    adminRevokedAt: nowIso(),
+    adminRevokedBy: currentUser.studentId
+  }));
+  render("관리자 권한을 해제했습니다.");
 }
 
 function getPointerStatuses() {

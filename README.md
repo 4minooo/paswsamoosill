@@ -45,15 +45,17 @@ node server.mjs
 
 Firebase 웹 설정값은 비밀 키가 아닙니다. 실제 보안은 Firestore Rules와 Authentication으로 관리합니다.
 
-첫 번째로 승인된 사용자는 자동으로 관리자 권한을 받습니다. 관리자를 학번으로 고정하고 싶다면 `firebase-config.js`에서 아래 값을 채웁니다.
+`firebase-config.js`의 `adminStudentIds`에 등록된 학번은 기본 관리자입니다. 기본 관리자는 항상 관리자 권한을 유지합니다.
 
 ```js
 window.officeAppConfig = {
-  adminStudentIds: ["202600000"]
+  adminStudentIds: ["202210276"]
 };
 ```
 
 회원가입한 사용자는 관리자가 승인하기 전까지 앱 기능을 사용할 수 없습니다. 승인된 회원만 근로생 명단에 표시됩니다.
+
+관리자는 근로생 명단에서 승인된 근로생에게 관리자 권한을 위임하거나, 위임된 관리자 권한을 해제할 수 있습니다. 기본 관리자는 해제하거나 추방할 수 없습니다.
 
 ## 개발용 로컬 모드
 
