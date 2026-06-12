@@ -340,6 +340,13 @@ button:disabled {
   background: rgba(255, 255, 255, 0.1);
 }
 
+.user-pill-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
 .user-pill strong {
   font-size: 14px;
 }
@@ -347,6 +354,15 @@ button:disabled {
 .user-pill span {
   color: rgba(255, 255, 255, 0.68);
   font-size: 12px;
+}
+
+.profile-button {
+  width: 30px;
+  min-width: 30px;
+  height: 30px;
+  min-height: 30px;
+  color: #fff;
+  background: rgba(255, 255, 255, 0.12);
 }
 
 .content {

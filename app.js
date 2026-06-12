@@ -16,8 +16,10 @@ const VIEW_LABELS = {
   calendar: "캘린더",
   todos: "To Do",
   memos: "메모장",
-  members: "근로생 명단"
+  members: "근로생 명단",
+  profile: "개인정보 설정"
 };
+const NAV_VIEWS = ["dashboard", "shifts", "courses", "calendar", "todos", "memos", "members"];
 
 const ADMIN_STUDENT_IDS = Array.isArray(window.officeAppConfig?.adminStudentIds)
   ? window.officeAppConfig.adminStudentIds.map(normalizeStudentId)
@@ -314,6 +316,7 @@ let services = { mode: "local", label: "로컬 저장" };
 let firebaseApi = null;
 let saveTimer = null;
 let workspaceUnsubscribe = null;
+let courseReturnTimer = null;
 
 const app = document.querySelector("#app");
 
@@ -323,6 +326,9 @@ async function boot() {
   services = await initFirebase();
   currentUser = await restoreSession();
   state = await loadState();
+  if (applyScheduledCourseReturns()) {
+    await flushSave();
+  }
   await enforceConfiguredAdmins();
   if (currentUser) {
     await reconcileCurrentMember();
@@ -330,6 +336,7 @@ async function boot() {
     startRealtimeSync();
   }
   attachGlobalListeners();
+  scheduleCourseReturnTimer();
   render();
 }
 
@@ -359,9 +366,12 @@ async function initFirebase() {
       auth: authModule.getAuth(firebaseApp),
       db: firestoreModule.getFirestore(firebaseApp),
       createUserWithEmailAndPassword: authModule.createUserWithEmailAndPassword,
+      EmailAuthProvider: authModule.EmailAuthProvider,
+      reauthenticateWithCredential: authModule.reauthenticateWithCredential,
       signInWithEmailAndPassword: authModule.signInWithEmailAndPassword,
       signOut: authModule.signOut,
       onAuthStateChanged: authModule.onAuthStateChanged,
+      updatePassword: authModule.updatePassword,
       updateProfile: authModule.updateProfile,
       doc: firestoreModule.doc,
       getDoc: firestoreModule.getDoc,
@@ -503,6 +513,7 @@ function mergeState(base, saved) {
 
 function scheduleSave() {
   clearTimeout(saveTimer);
+  scheduleCourseReturnTimer();
   saveTimer = setTimeout(persistState, 180);
 }
 
@@ -542,10 +553,15 @@ function startRealtimeSync() {
     async (snap) => {
       if (!snap.exists()) return;
       state = mergeState(createDefaultState(), snap.data()?.state || {});
+      const changedBySchedule = applyScheduledCourseReturns();
       await enforceConfiguredAdmins();
       refreshCurrentUserFromMember();
       if (selectedCourseId && !state.courses.some((course) => course.id === selectedCourseId)) {
         selectedCourseId = null;
+      }
+      scheduleCourseReturnTimer();
+      if (changedBySchedule) {
+        scheduleSave();
       }
       render();
     },
@@ -559,6 +575,12 @@ function stopRealtimeSync() {
   if (!workspaceUnsubscribe) return;
   workspaceUnsubscribe();
   workspaceUnsubscribe = null;
+}
+
+function stopCourseReturnTimer() {
+  if (!courseReturnTimer) return;
+  clearTimeout(courseReturnTimer);
+  courseReturnTimer = null;
 }
 
 function attachGlobalListeners() {
@@ -594,6 +616,11 @@ function attachGlobalListeners() {
     const { action } = target.dataset;
     if (action === "logout") {
       await logout();
+    }
+    if (action === "open-profile") {
+      activeView = "profile";
+      selectedCourseId = null;
+      render();
     }
     if (action === "close-drawer") {
       selectedCourseId = null;
@@ -658,6 +685,9 @@ function attachGlobalListeners() {
     }
     if (type === "event") {
       addEvent(form);
+    }
+    if (type === "password") {
+      await changePassword(form);
     }
   });
 }
@@ -761,7 +791,10 @@ function renderSidebar() {
       </nav>
       <div class="sidebar-footer">
         <div class="user-pill">
-          <strong>${escapeHtml(currentUser.name)}</strong>
+          <div class="user-pill-head">
+            <strong>${escapeHtml(currentUser.name)}</strong>
+            <button class="icon-button profile-button" type="button" data-action="open-profile" aria-label="개인정보 설정">⚙</button>
+          </div>
           <span>${escapeHtml(currentUser.studentId)}</span>
         </div>
         <button class="ghost-button" type="button" data-action="logout">로그아웃</button>
@@ -779,6 +812,10 @@ function renderMobileTopbar() {
       </div>
       <nav class="mobile-nav">
         ${renderNavButtons()}
+        <button class="nav-button" type="button" data-action="open-profile">
+          <span class="nav-icon">⚙</span>
+          설정
+        </button>
         <button class="nav-button" type="button" data-action="logout">
           <span class="nav-icon">↗</span>
           로그아웃
@@ -798,12 +835,12 @@ function renderNavButtons() {
     memos: "✎",
     members: "◇"
   };
-  return Object.entries(VIEW_LABELS)
+  return NAV_VIEWS
     .map(
-      ([view, label]) => `
+      (view) => `
         <button class="nav-button ${activeView === view ? "active" : ""}" type="button" data-nav="${view}">
           <span class="nav-icon">${icons[view]}</span>
-          ${label}
+          ${VIEW_LABELS[view]}
         </button>
       `
     )
@@ -820,7 +857,8 @@ function renderViewSubtitle() {
     calendar: "일정과 마감일",
     todos: "업무 목록",
     memos: "공지와 전달사항",
-    members: "승인된 회원이 근로생 명단입니다"
+    members: "승인된 회원이 근로생 명단입니다",
+    profile: "내 계정과 비밀번호"
   };
   return subtitles[activeView];
 }
@@ -833,6 +871,7 @@ function renderView() {
   if (activeView === "todos") return renderTodoView();
   if (activeView === "memos") return renderMemoView();
   if (activeView === "members") return renderMemberView();
+  if (activeView === "profile") return renderProfileView();
   return renderDashboard();
 }
 
@@ -840,7 +879,10 @@ function renderDashboard() {
   const todayDay = getKoreanDay(new Date());
   const todayShifts = getShiftsForDay(todayDay);
   const pendingTodos = state.todos.filter((todo) => !todo.done).sort(sortByDueDate).slice(0, 5);
-  const notices = state.memos.filter((memo) => memo.notice).sort(sortByCreatedDesc).slice(0, 4);
+  const sortedMemos = [...state.memos].sort(sortByCreatedDesc);
+  const noticeMemos = sortedMemos.filter((memo) => memo.notice);
+  const dashboardMemos = (noticeMemos.length ? noticeMemos : sortedMemos).slice(0, 4);
+  const dashboardMemoTitle = noticeMemos.length ? "공지" : "전달사항";
   const todayRemainingCourses = state.courses.filter((course) => course.day === todayDay && !isCourseRecovered(course.id)).length;
   const activePointers = getPointerStatuses().filter((pointer) => pointer.course).length;
 
@@ -873,11 +915,11 @@ function renderDashboard() {
       </div>
       <div class="panel">
         <div class="panel-header">
-          <h2>공지</h2>
+          <h2>${dashboardMemoTitle}</h2>
           <button class="secondary-button" type="button" data-nav="memos">메모장</button>
         </div>
         <div class="panel-body">
-          ${renderMemoList(notices)}
+          ${renderMemoList(dashboardMemos)}
         </div>
       </div>
       <div class="panel">
@@ -1258,6 +1300,58 @@ function renderMemoView() {
   `;
 }
 
+function renderProfileView() {
+  const member = getCurrentMember();
+  return `
+    <section class="two-column">
+      <div class="panel">
+        <div class="panel-header">
+          <h2>내 정보</h2>
+        </div>
+        <div class="panel-body">
+          <div class="detail-list">
+            ${renderDetail("이름", currentUser.name)}
+            ${renderDetail("학번", currentUser.studentId)}
+            ${renderDetail("권한", renderMemberStatus(member || currentUser))}
+          </div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-header">
+          <h2>비밀번호 변경</h2>
+        </div>
+        <div class="panel-body">
+          <form data-form="password" class="form-grid">
+            <div class="field full">
+              <label for="currentPassword">현재 비밀번호</label>
+              <input id="currentPassword" name="currentPassword" type="password" autocomplete="current-password" required />
+            </div>
+            <div class="field">
+              <label for="newPassword">새 비밀번호</label>
+              <input id="newPassword" name="newPassword" type="password" autocomplete="new-password" minlength="6" required />
+            </div>
+            <div class="field">
+              <label for="confirmPassword">새 비밀번호 확인</label>
+              <input id="confirmPassword" name="confirmPassword" type="password" autocomplete="new-password" minlength="6" required />
+            </div>
+            <div class="full">
+              <button class="primary-button" type="submit">비밀번호 변경</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </section>
+    <section class="panel" style="margin-top:16px;">
+      <div class="panel-header">
+        <h2>비밀번호 분실 안내</h2>
+      </div>
+      <div class="panel-body">
+        <p class="small-muted">비밀번호는 보안상 관리자도 확인할 수 없습니다. 비밀번호를 잊은 경우 관리자에게 초기화를 요청하고, 관리자는 Firebase Authentication 또는 별도 초기화 기능을 통해 새 비밀번호를 발급하는 방식으로 처리해야 합니다.</p>
+      </div>
+    </section>
+  `;
+}
+
 function renderMemberView() {
   const members = getMembersSorted();
   const approved = members.filter((member) => member.status === "approved");
@@ -1272,6 +1366,7 @@ function renderMemberView() {
       ${renderStat(banned.length, "추방 계정")}
       ${renderStat(approved.filter((member) => member.role === "admin").length, "관리자")}
     </section>
+    ${admin ? `<div class="top-message">비밀번호는 보안상 관리자도 확인할 수 없습니다. 분실자는 개인정보 설정에서 직접 변경하거나, 관리자에게 초기화 절차를 요청해야 합니다.</div>` : ""}
     <section class="two-column">
       <div class="panel">
         <div class="panel-header">
@@ -1641,8 +1736,69 @@ function handleLocalAuth({ name, studentId, password }) {
   localStorage.setItem(SESSION_KEY, JSON.stringify({ studentId }));
 }
 
+async function changePassword(form) {
+  const data = new FormData(form);
+  const currentPassword = String(data.get("currentPassword") || "");
+  const newPassword = String(data.get("newPassword") || "");
+  const confirmPassword = String(data.get("confirmPassword") || "");
+
+  if (!currentPassword || !newPassword || !confirmPassword) {
+    render("비밀번호를 모두 입력하세요.");
+    return;
+  }
+
+  if (newPassword.length < 6) {
+    render("새 비밀번호는 6자 이상이어야 합니다.");
+    return;
+  }
+
+  if (newPassword !== confirmPassword) {
+    render("새 비밀번호 확인이 일치하지 않습니다.");
+    return;
+  }
+
+  try {
+    if (services.mode === "firebase" && firebaseApi) {
+      const user = firebaseApi.auth.currentUser;
+      if (!user) throw new Error("로그인 세션을 확인할 수 없습니다.");
+      const email = `${currentUser.studentId}@pknu-work.app`;
+      const credential = firebaseApi.EmailAuthProvider.credential(email, currentPassword);
+      await firebaseApi.reauthenticateWithCredential(user, credential);
+      await firebaseApi.updatePassword(user, newPassword);
+    } else {
+      const users = readJson(USER_KEY, []);
+      const target = users.find((user) => user.studentId === currentUser.studentId);
+      if (!target || target.password !== currentPassword) {
+        throw new Error("현재 비밀번호가 일치하지 않습니다.");
+      }
+      target.password = newPassword;
+      currentUser = { ...currentUser, password: newPassword };
+      localStorage.setItem(USER_KEY, JSON.stringify(users));
+    }
+    form.reset();
+    render("비밀번호가 변경되었습니다.");
+  } catch (error) {
+    render(getPasswordErrorMessage(error));
+  }
+}
+
+function getPasswordErrorMessage(error) {
+  const code = error?.code || "";
+  if (code.includes("wrong-password") || code.includes("invalid-credential")) {
+    return "현재 비밀번호가 일치하지 않습니다.";
+  }
+  if (code.includes("weak-password")) {
+    return "새 비밀번호는 6자 이상이어야 합니다.";
+  }
+  if (code.includes("requires-recent-login")) {
+    return "보안을 위해 다시 로그인한 뒤 비밀번호를 변경하세요.";
+  }
+  return error?.message || "비밀번호 변경 중 오류가 발생했습니다.";
+}
+
 async function logout() {
   stopRealtimeSync();
+  stopCourseReturnTimer();
   if (services.mode === "firebase" && firebaseApi) {
     try {
       await firebaseApi.signOut(firebaseApi.auth);
@@ -1697,12 +1853,15 @@ function setupCourse(form) {
   const pointer = String(data.get("pointer") || "");
   if (!courseId || !pointer) return;
 
+  const previous = state.courseStates[courseId];
   state.courseStates[courseId] = {
     pointer,
     setupBy: currentUser.name,
     setupAt: nowIso(),
     recoveredBy: null,
-    recoveredAt: null
+    recoveredAt: null,
+    autoPendingAt: null,
+    history: previous?.history || []
   };
   scheduleSave();
   selectedCourseId = courseId;
@@ -1712,10 +1871,12 @@ function setupCourse(form) {
 function recoverCourse(courseId) {
   const record = state.courseStates[courseId];
   if (!record) return;
+  const recoveredAt = nowIso();
   state.courseStates[courseId] = {
     ...record,
     recoveredBy: currentUser.name,
-    recoveredAt: nowIso()
+    recoveredAt,
+    autoPendingAt: getNextMorningEightIso(recoveredAt)
   };
   scheduleSave();
   selectedCourseId = courseId;
@@ -1725,28 +1886,81 @@ function recoverCourse(courseId) {
 function returnCourseToPending(courseId) {
   const previous = state.courseStates[courseId];
   if (!previous) return;
+  state.courseStates[courseId] = buildPendingCourseRecord(previous, {
+    by: currentUser.name,
+    reason: "manual"
+  });
+  scheduleSave();
+  selectedCourseId = courseId;
+  render("세팅 전 상태로 돌렸습니다.");
+}
 
+function buildPendingCourseRecord(previous, { by = "system", reason = "auto" } = {}) {
+  const returnedAt = nowIso();
   const { history = [], ...snapshot } = previous;
-  state.courseStates[courseId] = {
+  return {
     pointer: null,
     setupBy: null,
     setupAt: null,
     recoveredBy: null,
     recoveredAt: null,
-    returnedToPendingBy: currentUser.name,
-    returnedToPendingAt: nowIso(),
+    autoPendingAt: null,
+    returnedToPendingBy: by,
+    returnedToPendingAt: returnedAt,
+    returnReason: reason,
     history: [
       ...history,
       {
         ...snapshot,
-        returnedToPendingBy: currentUser.name,
-        returnedToPendingAt: nowIso()
+        returnedToPendingBy: by,
+        returnedToPendingAt: returnedAt,
+        returnReason: reason
       }
     ]
   };
-  scheduleSave();
-  selectedCourseId = courseId;
-  render("세팅 전 상태로 돌렸습니다.");
+}
+
+function applyScheduledCourseReturns() {
+  const now = Date.now();
+  let changed = false;
+
+  Object.entries(state.courseStates || {}).forEach(([courseId, record]) => {
+    if (!record?.recoveredAt || !record?.autoPendingAt) return;
+    if (new Date(record.autoPendingAt).getTime() > now) return;
+    state.courseStates[courseId] = buildPendingCourseRecord(record, {
+      by: "system",
+      reason: "auto-next-day-08"
+    });
+    changed = true;
+  });
+
+  return changed;
+}
+
+function scheduleCourseReturnTimer() {
+  stopCourseReturnTimer();
+  const nextTime = Object.values(state.courseStates || {})
+    .filter((record) => record?.recoveredAt && record?.autoPendingAt)
+    .map((record) => new Date(record.autoPendingAt).getTime())
+    .filter((time) => Number.isFinite(time))
+    .sort((a, b) => a - b)[0];
+
+  if (!nextTime) return;
+  const delay = Math.max(0, nextTime - Date.now());
+  courseReturnTimer = setTimeout(() => {
+    if (applyScheduledCourseReturns()) {
+      scheduleSave();
+      render("회수 완료된 수업이 자동으로 세팅 전 상태로 돌아갔습니다.");
+    }
+    scheduleCourseReturnTimer();
+  }, Math.min(delay, 2147483647));
+}
+
+function getNextMorningEightIso(value) {
+  const date = new Date(value);
+  date.setDate(date.getDate() + 1);
+  date.setHours(8, 0, 0, 0);
+  return date.toISOString();
 }
 
 function addTodo(form) {
