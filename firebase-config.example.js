@@ -6,3 +6,7 @@ window.firebaseConfig = {
   messagingSenderId: "YOUR_MESSAGING_SENDER_ID",
   appId: "YOUR_FIREBASE_APP_ID"
 };
+
+window.officeAppConfig = {
+  adminStudentIds: ["YOUR_STUDENT_ID"]
+};

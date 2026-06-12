@@ -12,8 +12,13 @@ const VIEW_LABELS = {
   courses: "수업 세팅",
   calendar: "캘린더",
   todos: "To Do",
-  memos: "메모장"
+  memos: "메모장",
+  members: "근로생 명단"
 };
+
+const ADMIN_STUDENT_IDS = Array.isArray(window.officeAppConfig?.adminStudentIds)
+  ? window.officeAppConfig.adminStudentIds.map(normalizeStudentId)
+  : [];
 
 const WORKER_COLORS = [
   "#24756b",
@@ -281,27 +286,20 @@ const DEFAULT_COURSES = [
   }
 ];
 
-const DEFAULT_WORKERS = [
-  { id: "w-heo", name: "허지은", studentId: "", color: WORKER_COLORS[0] },
-  { id: "w-kim-ranji", name: "김란지", studentId: "", color: WORKER_COLORS[1] },
-  { id: "w-seo", name: "서민호", studentId: "", color: WORKER_COLORS[2] },
-  { id: "w-lee", name: "이다솜", studentId: "", color: WORKER_COLORS[3] },
-  { id: "w-kim-suyeon", name: "김수연", studentId: "", color: WORKER_COLORS[4] },
-  { id: "w-park", name: "박자민", studentId: "", color: WORKER_COLORS[5] }
-];
-
-const DEFAULT_SHIFTS = [
-  { id: "shift-mon-heo", workerName: "허지은", day: "월", start: "09:00", end: "13:00", repeat: true },
-  { id: "shift-mon-kim", workerName: "김란지", day: "월", start: "13:00", end: "17:00", repeat: true },
-  { id: "shift-tue-seo", workerName: "서민호", day: "화", start: "09:00", end: "13:00", repeat: true },
-  { id: "shift-tue-lee", workerName: "이다솜", day: "화", start: "13:00", end: "17:00", repeat: true },
-  { id: "shift-wed-heo", workerName: "허지은", day: "수", start: "10:00", end: "14:00", repeat: true },
-  { id: "shift-wed-kim", workerName: "김수연", day: "수", start: "14:00", end: "18:00", repeat: true },
-  { id: "shift-thu-ranji", workerName: "김란지", day: "목", start: "09:00", end: "13:00", repeat: true },
-  { id: "shift-thu-seo", workerName: "서민호", day: "목", start: "13:00", end: "17:00", repeat: true },
-  { id: "shift-fri-lee", workerName: "이다솜", day: "금", start: "10:00", end: "14:00", repeat: true },
-  { id: "shift-fri-park", workerName: "박자민", day: "금", start: "14:00", end: "18:00", repeat: true }
-];
+const DEFAULT_MEMBERS = [];
+const DEFAULT_SHIFTS = [];
+const LEGACY_SHIFT_IDS = new Set([
+  "shift-mon-heo",
+  "shift-mon-kim",
+  "shift-tue-seo",
+  "shift-tue-lee",
+  "shift-wed-heo",
+  "shift-wed-kim",
+  "shift-thu-ranji",
+  "shift-thu-seo",
+  "shift-fri-lee",
+  "shift-fri-park"
+]);
 
 let state = createDefaultState();
 let currentUser = null;
@@ -321,11 +319,18 @@ async function boot() {
   services = await initFirebase();
   currentUser = await restoreSession();
   state = await loadState();
+  if (currentUser) {
+    await reconcileCurrentMember();
+  }
   attachGlobalListeners();
   render();
 }
 
 async function initFirebase() {
+  if (new URL(window.location.href).searchParams.get("local") === "1") {
+    return { mode: "local", label: "로컬 저장" };
+  }
+
   const config = window.firebaseConfig;
   if (!config || !config.apiKey || config.apiKey.includes("YOUR_")) {
     return { mode: "local", label: "로컬 저장" };
@@ -407,8 +412,9 @@ async function restoreSession() {
 
 function createDefaultState() {
   return {
-    version: 1,
-    workers: structuredClone(DEFAULT_WORKERS),
+    version: 2,
+    members: structuredClone(DEFAULT_MEMBERS),
+    workers: [],
     shifts: structuredClone(DEFAULT_SHIFTS),
     courses: structuredClone(DEFAULT_COURSES),
     courseStates: {},
@@ -466,11 +472,19 @@ async function loadState() {
 }
 
 function mergeState(base, saved) {
+  const migratedMembers = Array.isArray(saved.members) ? saved.members : [];
+  const savedShifts = Array.isArray(saved.shifts) ? saved.shifts : base.shifts;
+  const migratedShifts = saved.version === 2
+    ? savedShifts
+    : savedShifts.filter((shift) => !LEGACY_SHIFT_IDS.has(shift.id));
+
   return {
     ...base,
     ...saved,
-    workers: saved.workers?.length ? saved.workers : base.workers,
-    shifts: saved.shifts?.length ? saved.shifts : base.shifts,
+    version: 2,
+    members: migratedMembers,
+    workers: [],
+    shifts: migratedShifts,
     courses: saved.courses?.length ? saved.courses : base.courses,
     courseStates: saved.courseStates || base.courseStates,
     todos: saved.todos || base.todos,
@@ -561,6 +575,15 @@ function attachGlobalListeners() {
     if (action === "delete-event") {
       deleteEvent(target.dataset.id);
     }
+    if (action === "approve-member") {
+      approveMember(target.dataset.id);
+    }
+    if (action === "ban-member") {
+      banMember(target.dataset.id);
+    }
+    if (action === "restore-member") {
+      restoreMember(target.dataset.id);
+    }
   });
 
   app.addEventListener("submit", async (event) => {
@@ -591,6 +614,12 @@ function attachGlobalListeners() {
 function render(message = "") {
   if (!currentUser) {
     renderAuth(message);
+    return;
+  }
+
+  const membership = getCurrentMember();
+  if (!membership || membership.status !== "approved") {
+    renderAccessGate(membership);
     return;
   }
 
@@ -650,6 +679,25 @@ function renderAuth(message = "") {
   `;
 }
 
+function renderAccessGate(membership) {
+  const isBanned = membership?.status === "banned";
+  app.innerHTML = `
+    <main class="auth-shell">
+      <section class="auth-panel">
+        <h1 class="auth-title">${APP_TITLE}</h1>
+        <p class="auth-subtitle">${escapeHtml(currentUser.name)} · ${escapeHtml(currentUser.studentId)}</p>
+        <div class="top-message">
+          ${isBanned ? "이 계정은 근로생 명단에서 제외되었습니다." : "회원가입 신청이 접수되었습니다. 관리자의 승인을 기다려 주세요."}
+        </div>
+        <p class="small-muted">
+          ${isBanned ? "다시 접근이 필요하면 관리자에게 복구를 요청하세요." : "승인되면 근로생 명단에 자동으로 추가되고 앱 기능을 사용할 수 있습니다."}
+        </p>
+        <button class="primary-button" type="button" data-action="logout">로그아웃</button>
+      </section>
+    </main>
+  `;
+}
+
 function renderSidebar() {
   return `
     <aside class="sidebar">
@@ -696,7 +744,8 @@ function renderNavButtons() {
     courses: "✓",
     calendar: "□",
     todos: "!",
-    memos: "✎"
+    memos: "✎",
+    members: "◇"
   };
   return Object.entries(VIEW_LABELS)
     .map(
@@ -719,7 +768,8 @@ function renderViewSubtitle() {
     courses: "포인터 세팅과 회수 현황",
     calendar: "일정과 마감일",
     todos: "업무 목록",
-    memos: "공지와 전달사항"
+    memos: "공지와 전달사항",
+    members: "승인된 회원이 근로생 명단입니다"
   };
   return subtitles[activeView];
 }
@@ -731,6 +781,7 @@ function renderView() {
   if (activeView === "calendar") return renderCalendarView();
   if (activeView === "todos") return renderTodoView();
   if (activeView === "memos") return renderMemoView();
+  if (activeView === "members") return renderMemberView();
   return renderDashboard();
 }
 
@@ -792,19 +843,18 @@ function renderDashboard() {
 }
 
 function renderShiftView() {
+  const currentMember = getCurrentMember();
   return `
     <section class="two-column">
       <div class="panel">
         <div class="panel-header">
-          <h2>근로 일정 추가</h2>
+          <h2>내 근로 일정 추가</h2>
         </div>
         <div class="panel-body">
           <form data-form="shift" class="form-grid">
-            <div class="field">
-              <label for="shiftWorker">근로생</label>
-              <select id="shiftWorker" name="workerName" required>
-                ${state.workers.map((worker) => `<option value="${escapeAttr(worker.name)}">${escapeHtml(worker.name)}</option>`).join("")}
-              </select>
+            <div class="field full">
+              <label>근로생</label>
+              <input value="${escapeAttr(currentMember?.name || currentUser.name)}" disabled />
             </div>
             <div class="field">
               <label for="shiftDay">요일</label>
@@ -813,12 +863,16 @@ function renderShiftView() {
               </select>
             </div>
             <div class="field">
-              <label for="shiftStart">시작</label>
-              <input id="shiftStart" name="start" type="time" required />
+              <label for="shiftStart">시작 시간</label>
+              <select id="shiftStart" name="start" required>
+                ${renderTimeOptions("09:00")}
+              </select>
             </div>
             <div class="field">
-              <label for="shiftEnd">종료</label>
-              <input id="shiftEnd" name="end" type="time" required />
+              <label for="shiftEnd">종료 시간</label>
+              <select id="shiftEnd" name="end" required>
+                ${renderTimeOptions("18:00")}
+              </select>
             </div>
             <label class="checkbox-field full">
               <input name="repeat" type="checkbox" checked />
@@ -836,7 +890,7 @@ function renderShiftView() {
         </div>
         <div class="panel-body">
           <div class="shift-list">
-            ${state.workers
+            ${getApprovedMembers().length ? getApprovedMembers()
               .map(
                 (worker) => `
                   <div class="shift-card" style="--worker-color: ${worker.color}">
@@ -847,7 +901,7 @@ function renderShiftView() {
                   </div>
                 `
               )
-              .join("")}
+              .join("") : `<div class="empty-state">승인된 근로생이 없습니다.</div>`}
           </div>
         </div>
       </div>
@@ -855,6 +909,7 @@ function renderShiftView() {
     <section class="panel" style="margin-top:16px;">
       <div class="panel-header">
         <h2>일주일 근로 시간표</h2>
+        <span class="badge teal">00~24시 기준</span>
       </div>
       <div class="panel-body">
         ${renderShiftTimetable()}
@@ -865,18 +920,50 @@ function renderShiftView() {
 
 function renderShiftTimetable() {
   return `
-    <div class="timetable">
+    <div class="timetable shift-timetable">
       ${DAYS.map((day) => {
         const shifts = getShiftsForDay(day);
         return `
-          <div class="day-column">
+          <div class="day-column shift-day">
             <div class="day-title">${day}<span>${shifts.length}건</span></div>
-            <div class="course-list">
-              ${renderShiftList(shifts)}
-            </div>
+            ${renderDayTimeline(shifts)}
           </div>
         `;
       }).join("")}
+    </div>
+  `;
+}
+
+function renderDayTimeline(shifts) {
+  return `
+    <div class="timeline-wrap">
+      <div class="timeline-grid">
+        ${Array.from({ length: 25 }, (_, hour) => `<span class="hour-label">${String(hour).padStart(2, "0")}:00</span>`).join("")}
+      </div>
+      <div class="timeline-lane">
+        ${shifts.sort(sortByShiftTime).map(renderShiftBlock).join("")}
+      </div>
+    </div>
+  `;
+}
+
+function renderShiftBlock(shift) {
+  const worker = findWorker(shift.workerName, shift.studentId);
+  const start = minutesFromHHMM(shift.start);
+  const end = minutesFromHHMM(shift.end);
+  const top = Math.max(0, (start / 1440) * 100);
+  const height = Math.max(3.2, ((end - start) / 1440) * 100);
+  const canDelete = canManageShift(shift);
+
+  return `
+    <div class="shift-block" style="--worker-color: ${worker?.color || WORKER_COLORS[0]}; top: ${top}%; height: ${height}%;">
+      <div class="item-head">
+        <div>
+          <strong>${escapeHtml(shift.workerName)}</strong>
+          <span>${escapeHtml(shift.start)}~${escapeHtml(shift.end)}</span>
+        </div>
+        ${canDelete ? `<button class="icon-button mini" type="button" data-action="delete-shift" data-id="${shift.id}" aria-label="삭제">×</button>` : ""}
+      </div>
     </div>
   `;
 }
@@ -1112,6 +1199,50 @@ function renderMemoView() {
   `;
 }
 
+function renderMemberView() {
+  const members = getMembersSorted();
+  const approved = members.filter((member) => member.status === "approved");
+  const pending = members.filter((member) => member.status === "pending");
+  const banned = members.filter((member) => member.status === "banned");
+  const admin = isCurrentAdmin();
+
+  return `
+    <section class="stat-grid">
+      ${renderStat(approved.length, "승인 근로생")}
+      ${renderStat(pending.length, "승인 대기")}
+      ${renderStat(banned.length, "추방 계정")}
+      ${renderStat(approved.filter((member) => member.role === "admin").length, "관리자")}
+    </section>
+    <section class="two-column">
+      <div class="panel">
+        <div class="panel-header">
+          <h2>승인된 근로생</h2>
+        </div>
+        <div class="panel-body">
+          ${renderMemberList(approved, admin)}
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-header">
+          <h2>승인 대기</h2>
+          ${admin ? `<span class="badge amber">관리자 승인 필요</span>` : ""}
+        </div>
+        <div class="panel-body">
+          ${renderMemberList(pending, admin)}
+        </div>
+      </div>
+    </section>
+    <section class="panel" style="margin-top:16px;">
+      <div class="panel-header">
+        <h2>추방된 회원</h2>
+      </div>
+      <div class="panel-body">
+        ${renderMemberList(banned, admin)}
+      </div>
+    </section>
+  `;
+}
+
 function renderStat(value, label) {
   return `
     <div class="stat">
@@ -1131,7 +1262,8 @@ function renderShiftList(shifts) {
       ${shifts
         .sort(sortByShiftTime)
         .map((shift) => {
-          const worker = findWorker(shift.workerName);
+          const worker = findWorker(shift.workerName, shift.studentId);
+          const canDelete = canManageShift(shift);
           return `
             <div class="shift-card" style="--worker-color: ${worker?.color || WORKER_COLORS[0]}">
               <div class="item-head">
@@ -1140,7 +1272,7 @@ function renderShiftList(shifts) {
                   <div class="small-muted">${escapeHtml(shift.day)} · ${escapeHtml(shift.start)}~${escapeHtml(shift.end)} ${shift.repeat ? "· 매주" : ""}</div>
                 </div>
                 <div class="item-actions">
-                  <button class="icon-button" type="button" data-action="delete-shift" data-id="${shift.id}" aria-label="삭제">×</button>
+                  ${canDelete ? `<button class="icon-button" type="button" data-action="delete-shift" data-id="${shift.id}" aria-label="삭제">×</button>` : ""}
                 </div>
               </div>
             </div>
@@ -1208,6 +1340,46 @@ function renderMemoList(memos) {
         .join("")}
     </div>
   `;
+}
+
+function renderMemberList(members, admin) {
+  if (!members.length) {
+    return `<div class="empty-state">표시할 회원이 없습니다.</div>`;
+  }
+
+  return `
+    <div class="memo-list">
+      ${members
+        .map((member) => {
+          const canBan = admin && member.status === "approved" && member.studentId !== currentUser.studentId;
+          const canApprove = admin && member.status === "pending";
+          const canRestore = admin && member.status === "banned";
+          return `
+            <div class="shift-card" style="--worker-color: ${member.color || WORKER_COLORS[0]}">
+              <div class="item-head">
+                <div>
+                  <strong>${escapeHtml(member.name)}</strong>
+                  <div class="small-muted">${escapeHtml(member.studentId)} · ${renderMemberStatus(member)}</div>
+                </div>
+                <div class="item-actions">
+                  ${canApprove ? `<button class="secondary-button" type="button" data-action="approve-member" data-id="${member.studentId}">승인</button>` : ""}
+                  ${canBan ? `<button class="danger-button" type="button" data-action="ban-member" data-id="${member.studentId}">추방</button>` : ""}
+                  ${canRestore ? `<button class="secondary-button" type="button" data-action="restore-member" data-id="${member.studentId}">복구</button>` : ""}
+                </div>
+              </div>
+            </div>
+          `;
+        })
+        .join("")}
+    </div>
+  `;
+}
+
+function renderMemberStatus(member) {
+  const role = member.role === "admin" ? "관리자" : "근로생";
+  if (member.status === "pending") return "승인 대기";
+  if (member.status === "banned") return "추방됨";
+  return role;
 }
 
 function renderEventList(events) {
@@ -1337,7 +1509,7 @@ async function handleAuth(form) {
     } else {
       handleLocalAuth({ name, studentId, password });
     }
-    ensureWorker(currentUser.name, currentUser.studentId);
+    await reconcileCurrentMember({ signup: authMode === "signup" });
     scheduleSave();
     render();
   } catch (error) {
@@ -1420,17 +1592,22 @@ async function logout() {
 
 function addShift(form) {
   const data = new FormData(form);
-  const workerName = String(data.get("workerName") || "").trim();
   const day = String(data.get("day") || "");
   const start = String(data.get("start") || "");
   const end = String(data.get("end") || "");
   const repeat = data.get("repeat") === "on";
+  const member = getCurrentMember();
 
-  if (!workerName || !day || !start || !end) return;
+  if (!member || !day || !start || !end) return;
+  if (minutesFromHHMM(end) <= minutesFromHHMM(start)) {
+    render("종료 시간은 시작 시간보다 뒤여야 합니다.");
+    return;
+  }
 
   state.shifts.push({
     id: makeId("shift"),
-    workerName,
+    workerName: member.name,
+    studentId: member.studentId,
     day,
     start,
     end,
@@ -1441,7 +1618,9 @@ function addShift(form) {
 }
 
 function deleteShift(id) {
-  state.shifts = state.shifts.filter((shift) => shift.id !== id);
+  const shift = state.shifts.find((item) => item.id === id);
+  if (!shift || !canManageShift(shift)) return;
+  state.shifts = state.shifts.filter((item) => item.id !== id);
   scheduleSave();
   render();
 }
@@ -1563,14 +1742,146 @@ function deleteEvent(id) {
   render();
 }
 
-function ensureWorker(name, studentId) {
-  if (!name || state.workers.some((worker) => worker.name === name)) return;
-  state.workers.push({
-    id: makeId("worker"),
-    name,
-    studentId,
-    color: WORKER_COLORS[state.workers.length % WORKER_COLORS.length]
+async function reconcileCurrentMember(options = {}) {
+  if (!currentUser) return null;
+
+  const existing = state.members.find((member) => member.studentId === currentUser.studentId);
+  if (existing) {
+    currentUser = {
+      ...currentUser,
+      name: existing.name,
+      role: existing.role,
+      status: existing.status,
+      color: existing.color
+    };
+    return existing;
+  }
+
+  const shouldApprove = shouldAutoApprove(currentUser.studentId);
+  const member = {
+    id: currentUser.id || `member-${currentUser.studentId}`,
+    name: currentUser.name || "근로생",
+    studentId: currentUser.studentId,
+    role: shouldApprove ? "admin" : "worker",
+    status: shouldApprove ? "approved" : "pending",
+    color: WORKER_COLORS[state.members.length % WORKER_COLORS.length],
+    createdAt: nowIso(),
+    approvedAt: shouldApprove ? nowIso() : null,
+    approvedBy: shouldApprove ? "system" : null,
+    bannedAt: null
+  };
+
+  state.members.push(member);
+  currentUser = { ...currentUser, role: member.role, status: member.status, color: member.color };
+  await syncMemberProfile(member);
+  scheduleSave();
+  return member;
+}
+
+function shouldAutoApprove(studentId) {
+  if (ADMIN_STUDENT_IDS.includes(studentId)) return true;
+  return !state.members.some((member) => member.role === "admin" && member.status === "approved");
+}
+
+async function syncMemberProfile(member) {
+  if (services.mode !== "firebase" || !firebaseApi) return;
+  try {
+    const userRef = firebaseApi.doc(firebaseApi.db, "users", member.studentId);
+    await firebaseApi.setDoc(
+      userRef,
+      {
+        name: member.name,
+        studentId: member.studentId,
+        role: member.role,
+        status: member.status,
+        color: member.color,
+        updatedAt: firebaseApi.serverTimestamp()
+      },
+      { merge: true }
+    );
+  } catch (error) {
+    console.warn("멤버 프로필 저장 실패", error);
+  }
+}
+
+function getApprovedMembers() {
+  return state.members.filter((member) => member.status === "approved");
+}
+
+function getMembersSorted() {
+  const rank = { pending: 0, approved: 1, banned: 2 };
+  return [...state.members].sort((a, b) => {
+    return (rank[a.status] ?? 9) - (rank[b.status] ?? 9) || a.name.localeCompare(b.name, "ko");
   });
+}
+
+function getCurrentMember() {
+  if (!currentUser) return null;
+  return state.members.find((member) => member.studentId === currentUser.studentId) || null;
+}
+
+function isCurrentAdmin() {
+  const member = getCurrentMember();
+  return member?.status === "approved" && member?.role === "admin";
+}
+
+function updateMember(studentId, updater) {
+  state.members = state.members.map((member) => {
+    if (member.studentId !== studentId) return member;
+    return updater(member);
+  });
+  const updated = state.members.find((member) => member.studentId === studentId);
+  if (updated) {
+    syncMemberProfile(updated);
+  }
+  if (currentUser?.studentId === studentId) {
+    currentUser = {
+      ...currentUser,
+      role: updated.role,
+      status: updated.status,
+      color: updated.color
+    };
+  }
+  scheduleSave();
+}
+
+function approveMember(studentId) {
+  if (!isCurrentAdmin()) return;
+  updateMember(studentId, (member) => ({
+    ...member,
+    status: "approved",
+    role: member.role || "worker",
+    approvedAt: nowIso(),
+    approvedBy: currentUser.studentId,
+    bannedAt: null
+  }));
+  render("근로생 가입을 승인했습니다.");
+}
+
+function banMember(studentId) {
+  if (!isCurrentAdmin() || studentId === currentUser.studentId) return;
+  updateMember(studentId, (member) => ({
+    ...member,
+    status: "banned",
+    bannedAt: nowIso(),
+    bannedBy: currentUser.studentId
+  }));
+  state.shifts = state.shifts.filter((shift) => shift.studentId !== studentId);
+  scheduleSave();
+  render("근로생을 명단에서 제외했습니다.");
+}
+
+function restoreMember(studentId) {
+  if (!isCurrentAdmin()) return;
+  updateMember(studentId, (member) => ({
+    ...member,
+    status: "approved",
+    approvedAt: nowIso(),
+    approvedBy: currentUser.studentId,
+    bannedAt: null,
+    bannedBy: null
+  }));
+  render("근로생 계정을 복구했습니다.");
 }
 
 function getPointerStatuses() {
@@ -1610,8 +1921,12 @@ function getKoreanDay(date) {
   return DAYS.find((day) => DAY_INDEX[day] === jsDay) || "주말";
 }
 
-function findWorker(name) {
-  return state.workers.find((worker) => worker.name === name);
+function canManageShift(shift) {
+  return Boolean(currentUser?.studentId && shift.studentId === currentUser.studentId);
+}
+
+function findWorker(name, studentId = "") {
+  return getApprovedMembers().find((worker) => worker.studentId === studentId) || getApprovedMembers().find((worker) => worker.name === name);
 }
 
 function sortByShiftTime(a, b) {
@@ -1632,6 +1947,25 @@ function sortByDateAsc(a, b) {
 
 function sortByCreatedDesc(a, b) {
   return b.createdAt.localeCompare(a.createdAt);
+}
+
+function renderTimeOptions(selected = "") {
+  return Array.from({ length: 49 }, (_, index) => {
+    const minutes = index * 30;
+    const value = minutesToHHMM(minutes);
+    return `<option value="${value}" ${value === selected ? "selected" : ""}>${value}</option>`;
+  }).join("");
+}
+
+function minutesFromHHMM(value) {
+  const [hour, minute] = String(value).split(":").map(Number);
+  return (Number.isFinite(hour) ? hour : 0) * 60 + (Number.isFinite(minute) ? minute : 0);
+}
+
+function minutesToHHMM(minutes) {
+  const hour = Math.floor(minutes / 60);
+  const minute = minutes % 60;
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
 }
 
 function extractHour(time) {
